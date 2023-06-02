@@ -1,8 +1,12 @@
+import tempfile
 from typing import Union, List, Callable
 
+import torch
+import torchvision.transforms.functional
+from PIL import Image
 import gradio as gr
 
-from modules.processing import StableDiffusionProcessing
+from modules.processing import StableDiffusionProcessing, Processed
 from modules import scripts
 
 from scripts.llul_hooker import Hooker, Upscaler, Downscaler
@@ -30,9 +34,15 @@ class Script(scripts.Script):
         with gr.Group():
             with gr.Accordion(NAME, open=False, elem_id=id('accordion')):
                 enabled = gr.Checkbox(label='Enabled', value=False)
-                multiply = gr.Slider(value=1, minimum=1, maximum=5, step=1, label='Multiplication (2^N)', elem_id=id('m'))
-                weight = gr.Slider(minimum=-1, maximum=2, value=0.15, step=0.01, label='Weight')
+                with gr.Row():
+                    weight = gr.Slider(minimum=-1, maximum=2, value=0.15, step=0.01, label='Weight')
+                    multiply = gr.Slider(value=1, minimum=1, maximum=5, step=1, label='Multiplication (2^N)', elem_id=id('m'))
                 gr.HTML(elem_id=id('container'))
+                add_area_image = gr.Checkbox(value=True, label='Add the effective area to output images.')
+                
+                with gr.Row():
+                    use_mask = gr.Checkbox(value=False, label='Enable mask which scales the weight (black = 0.0, white = 1.0)')
+                    mask = gr.File(interactive=True, label='Upload mask image', elem_id=id('mask'))
                 
                 force_float = gr.Checkbox(label='Force convert half to float on interpolation (for some platforms)', value=False)
                 understand = gr.Checkbox(label='I know what I am doing.', value=False)
@@ -45,7 +55,7 @@ class Script(scripts.Script):
                         up = gr.Radio(choices=['Nearest', 'Bilinear', 'Bicubic'], value='Bilinear', label='Upscaling')
                         up_aa = gr.Checkbox(value=False, label='Enable AA for Upscaling.')
                     with gr.Row():
-                        down = gr.Radio(choices=['Nearest', 'Bilinear', 'Bicubic', 'Area', 'Pooling Max', 'Pooling Avg'], value='Pooling Max', label='Downscaling')
+                        down = gr.Radio(choices=['Nearest', 'Bilinear', 'Bicubic', 'Area', 'Pooling Max', 'Pooling Avg'], value='Bilinear', label='Downscaling')
                         down_aa = gr.Checkbox(value=False, label='Enable AA for Downscaling.')
                     intp = gr.Radio(choices=['Lerp', 'SLerp'], value='Lerp', label='interpolation method')
                 
@@ -79,6 +89,9 @@ class Script(scripts.Script):
             x,
             y,
             force_float,
+            use_mask,
+            mask,
+            add_area_image,
         ]
     
     def process(
@@ -100,6 +113,9 @@ class Script(scripts.Script):
         x: Union[str,None] = None,
         y: Union[str,None] = None,
         force_float = False,
+        use_mask: bool = False,
+        mask: Union[tempfile._TemporaryFileWrapper,None] = None,
+        add_area_image: bool = True, # for postprocess
     ):
         if self.last_hooker is not None:
             self.last_hooker.__exit__(None, None, None)
@@ -137,11 +153,17 @@ class Script(scripts.Script):
             start_steps = 5
             max_steps = int(p.steps)
             up_fn = Upscaler('bilinear', aa=False)
-            down_fn = Downscaler('pooling max', aa=False)
+            down_fn = Downscaler('bilinear', aa=False)
             intp = 'lerp'
         
         xf = float(x)
         yf = float(y)
+        
+        mask_image = None
+        if use_mask and mask is not None:
+            # Can I read from passed tempfile._TemporaryFileWrapper???
+            mask_image = Image.open(mask.name).convert('L')
+            intp = 'lerp'
         
         self.last_hooker = Hooker(
             enabled=True,
@@ -157,6 +179,7 @@ class Script(scripts.Script):
             x=xf/p.width,
             y=yf/p.height,
             force_float=force_float,
+            mask_image=mask_image,
         )
         
         self.last_hooker.setup(p)
@@ -176,6 +199,78 @@ class Script(scripts.Script):
             f'{NAME} x': x,
             f'{NAME} y': y,
         })
+    
+    def postprocess(
+        self,
+        p: StableDiffusionProcessing,
+        proc: Processed,
+        enabled: bool,
+        multiply: Union[int,float],
+        weight: float,
+        understand: bool,
+        layers: str,
+        apply_to: Union[List[str],str],
+        start_steps: Union[int,float],
+        max_steps: Union[int,float],
+        up: str,
+        up_aa: bool,
+        down: str,
+        down_aa: bool,
+        intp: str,
+        x: Union[str,None] = None,
+        y: Union[str,None] = None,
+        force_float = False,
+        use_mask: bool = False,
+        mask: Union[tempfile._TemporaryFileWrapper,None] = None,
+        add_area_image: bool = True,
+    ):
+        if not enabled:
+            return
+        
+        multiply = int(2 ** int(max(multiply, 0)))
+        if x is None or len(x) == 0:
+            x = str((p.width - p.width // multiply) // 2)
+        if y is None or len(y) == 0:
+            y = str((p.height - p.height // multiply) // 2)
+        
+        xi0 = int(x)
+        yi0 = int(y)
+        xi1 = xi0 + p.width // multiply
+        yi1 = yi0 + p.height // multiply
+        
+        area = torch.zeros((1, p.height, p.width), dtype=torch.float)
+        area[:, yi0:yi1, xi0:xi1] = 1.0
+        
+        pil_to_tensor = torchvision.transforms.functional.to_tensor
+        tensor_to_pil = torchvision.transforms.functional.to_pil_image
+        
+        if use_mask and mask is not None:
+            # Can I read from passed tempfile._TemporaryFileWrapper???
+            mask_image = Image.open(mask.name).convert('L').resize((xi1 - xi0, yi1 - yi0), Image.BILINEAR)
+            mask_tensor = pil_to_tensor(mask_image)
+            # :: (1,h,w), each value is between 0 and 1
+            area[:, yi0:yi1, xi0:xi1] = mask_tensor
+        
+        # (0.0, 1.0) -> (0.25, 1.0)
+        area.mul_(0.75).add_(0.25)
+        
+        for image_index in range(len(proc.images)):
+            is_grid = image_index < proc.index_of_first_image
+            if is_grid:
+                continue
+            
+            area_tensor = pil_to_tensor(proc.images[image_index])
+            area_tensor.mul_(area)
+            area_image = tensor_to_pil(area_tensor, mode='RGB')
+            
+            i = image_index - proc.index_of_first_image
+            proc.images.append(area_image)
+            proc.all_prompts.append(proc.all_prompts[i])
+            proc.all_negative_prompts.append(proc.all_negative_prompts[i])
+            proc.all_seeds.append(proc.all_seeds[i])
+            proc.all_subseeds.append(proc.all_subseeds[i])
+            proc.infotexts.append(proc.infotexts[image_index])
+        
 
 def js2py(
     name: str,

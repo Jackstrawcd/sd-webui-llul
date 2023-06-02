@@ -14,3 +14,24 @@
 .llul-bg-setting label {
     user-select: none;
 }
+
+#llul-txt2img-mask,
+#llul-img2img-mask {
+    max-height: 2em;
+    overflow: visible;
+}
+
+.llul-pos input {
+    display: inline-block;
+    border: none;
+    border-bottom: 1px solid black;
+    font-size: smaller !important;
+    width: 8em;
+    height: 1em;
+    background-color: transparent;
+    margin-right: 1em;
+}
+
+.dark .llul-pos input {
+    border-bottom-color: white;
+}
